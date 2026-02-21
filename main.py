@@ -1,55 +1,52 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import Response, JSONResponse
-import numpy as np
+from flask import Flask, request, send_file, jsonify
+from PIL import Image
+import io
 
-app = FastAPI(title="ourbang-panorama-demo")
-
-def _read_image(upload: UploadFile):
-    import cv2
-    data = upload.file.read()
-    if not data:
-        return None
-    arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return img
+app = Flask(__name__)
 
 @app.get("/")
-def root():
-    return {"ok": True, "service": "ourbang-panorama-demo"}
+def health():
+    return jsonify({"ok": True, "service": "ourbang-panorama-light", "endpoints": ["/panorama"]})
 
 @app.post("/panorama")
-async def panorama(images: list[UploadFile] = File(...)):
-    """Accepts multipart form with repeated field name 'images'.
-    Returns JPEG bytes (stitched panorama) on success."""
-    try:
-        import cv2
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"cv2 import failed: {e}"}, status_code=500)
+def panorama():
+    # Expect multipart field name: images (repeatable)
+    files = request.files.getlist("images")
+    if not files:
+        return jsonify({"ok": False, "error": "No files. Use multipart field name 'images'."}), 400
 
+    # Load images (RGB)
     imgs = []
-    for up in images:
-        img = _read_image(up)
-        if img is not None:
+    for f in files[:12]:  # limit for demo stability
+        try:
+            img = Image.open(f.stream).convert("RGB")
             imgs.append(img)
+        except Exception:
+            continue
 
-    if len(imgs) < 2:
-        return JSONResponse({"ok": False, "error": "Need at least 2 images."}, status_code=400)
+    if not imgs:
+        return jsonify({"ok": False, "error": "Could not decode any images."}), 400
 
-    try:
-        stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-    except Exception:
-        stitcher = cv2.Stitcher_create()
+    # Simple, robust "stitch": resize all to same height, concatenate horizontally.
+    target_h = min(img.height for img in imgs)
+    resized = []
+    for img in imgs:
+        if img.height != target_h:
+            w = int(img.width * (target_h / img.height))
+            img = img.resize((max(1, w), target_h))
+        resized.append(img)
 
-    status, pano = stitcher.stitch(imgs)
+    total_w = sum(img.width for img in resized)
+    pano = Image.new("RGB", (total_w, target_h))
+    x = 0
+    for img in resized:
+        pano.paste(img, (x, 0))
+        x += img.width
 
-    if status != 0 or pano is None:
-        return JSONResponse(
-            {"ok": False, "error": f"stitch failed (status={status}). Try more overlap / consistent exposure."},
-            status_code=422
-        )
+    out = io.BytesIO()
+    pano.save(out, format="JPEG", quality=85)
+    out.seek(0)
+    return send_file(out, mimetype="image/jpeg", as_attachment=False, download_name="pano.jpg")
 
-    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-    if not ok:
-        return JSONResponse({"ok": False, "error": "JPEG encode failed."}, status_code=500)
-
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
