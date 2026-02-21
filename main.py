@@ -1,52 +1,57 @@
-from flask import Flask, request, send_file, jsonify
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse, Response
 from PIL import Image
 import io
 
-app = Flask(__name__)
+app = FastAPI(title="ourbang-panorama-demo")
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "ourbang-panorama-light", "endpoints": ["/panorama"]})
+    return {"ok": True, "service": "ourbang-panorama-demo"}
+
+def _read_image(upload: UploadFile) -> Image.Image:
+    data = upload.file.read()
+    if not data:
+        raise ValueError("empty file")
+    img = Image.open(io.BytesIO(data))
+    return img.convert("RGB")
 
 @app.post("/panorama")
-def panorama():
-    # Expect multipart field name: images (repeatable)
-    files = request.files.getlist("images")
-    if not files:
-        return jsonify({"ok": False, "error": "No files. Use multipart field name 'images'."}), 400
+async def panorama(images: list[UploadFile] = File(...)):
+    try:
+        if not images or len(images) < 2:
+            return JSONResponse({"ok": False, "error": "Need at least 2 images."}, status_code=400)
 
-    # Load images (RGB)
-    imgs = []
-    for f in files[:12]:  # limit for demo stability
-        try:
-            img = Image.open(f.stream).convert("RGB")
-            imgs.append(img)
-        except Exception:
-            continue
+        # Read all images
+        pil_images = []
+        for up in images:
+            try:
+                pil_images.append(_read_image(up))
+            finally:
+                try:
+                    up.file.close()
+                except Exception:
+                    pass
 
-    if not imgs:
-        return jsonify({"ok": False, "error": "Could not decode any images."}), 400
+        # Normalize height to smallest to reduce memory
+        min_h = min(im.height for im in pil_images)
+        resized = []
+        for im in pil_images:
+            if im.height != min_h:
+                w = int(im.width * (min_h / im.height))
+                resized.append(im.resize((max(1, w), min_h)))
+            else:
+                resized.append(im)
 
-    # Simple, robust "stitch": resize all to same height, concatenate horizontally.
-    target_h = min(img.height for img in imgs)
-    resized = []
-    for img in imgs:
-        if img.height != target_h:
-            w = int(img.width * (target_h / img.height))
-            img = img.resize((max(1, w), target_h))
-        resized.append(img)
+        total_w = sum(im.width for im in resized)
+        pano = Image.new("RGB", (total_w, min_h))
+        x = 0
+        for im in resized:
+            pano.paste(im, (x, 0))
+            x += im.width
 
-    total_w = sum(img.width for img in resized)
-    pano = Image.new("RGB", (total_w, target_h))
-    x = 0
-    for img in resized:
-        pano.paste(img, (x, 0))
-        x += img.width
-
-    out = io.BytesIO()
-    pano.save(out, format="JPEG", quality=85)
-    out.seek(0)
-    return send_file(out, mimetype="image/jpeg", as_attachment=False, download_name="pano.jpg")
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+        out = io.BytesIO()
+        pano.save(out, format="JPEG", quality=90)
+        return Response(content=out.getvalue(), media_type="image/jpeg")
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
